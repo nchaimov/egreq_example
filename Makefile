@@ -1,9 +1,9 @@
 MPICC=mpicc
 
-all : greq
+all : egreq
 
 egreq : egreq.c
-	$(MPICC) -o $@ $^
+	$(MPICC) -g -o $@ $^
 
 run : egreq
 	mpirun -np 2 ./egreq
