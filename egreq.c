@@ -1,9 +1,35 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <mpi.h>
+
+#include "nbc_op.h"
+
+
+// TODO MPI_IN_PLACE support
+// TODO User definedoperations
 
 #ifdef DEBUG
 #define LOG(...) fprintf(__VA_ARGS__)
+
+const char * op_to_string(MPI_Op op) {
+    switch(op) {
+        case MPI_MAX: return "MPI_MAX";
+        case MPI_MIN: return "MPI_MIN";
+        case MPI_SUM: return "MPI_SUM";
+        case MPI_PROD: return "MPI_PROD";
+        case MPI_LAND: return "MPI_LAND";
+        case MPI_BAND: return "MPI_BAND";
+        case MPI_LOR: return "MPI_LOR";
+        case MPI_BOR: return "MPI_BOR";
+        case MPI_LXOR: return "MPI_LXOR";
+        case MPI_BXOR: return "MPI_BXOR";
+        case MPI_MAXLOC: return "MPI_MAXLOC";
+        case MPI_MINLOC: return "MPI_MINLOC";
+    }
+    return "Unknown MPI_Op";
+}
+
 #else
 #define LOG(...) 
 #endif
@@ -13,6 +39,8 @@ typedef enum {
     TYPE_SEND,
     TYPE_RECV,
     TYPE_WAIT,
+    TYPE_MPI_OP,
+    TYPE_FREE,
     TYPE_COUNT
 }nbc_op_type;
 
@@ -20,7 +48,9 @@ static const char * const strops[TYPE_COUNT] = {
     "NULL",
     "SEND",
     "RECV",
-    "WAIT"
+    "WAIT",
+    "MPI_OP",
+    "FREE"
 };
 
 
@@ -37,9 +67,12 @@ struct nbc_op{
     int remote;
     MPI_Comm comm;
     void * buff;
+    void * buff2;
+    void * out_buff;
     int tag;
     MPI_Datatype datatype;
     int count;
+    MPI_Op mpi_op;
     MPI_Request request;
 };
 
@@ -50,7 +83,7 @@ typedef struct _xMPI_Request
     int size;
     int current_off;
     MPI_Request * myself;
-}xMPI_Request;
+} xMPI_Request;
 
 
 
@@ -71,6 +104,8 @@ int nbc_op_init( struct nbc_op * op,
     op->remote = remote;
     op->comm = comm;
     op->buff = buff;
+    op->buff2 = NULL;
+    op->out_buff = NULL;
     op->datatype = datatype;
     op->count = count;
     op->tag = tag;
@@ -82,6 +117,31 @@ int nbc_op_wait_init(struct nbc_op * op) {
     op->t = TYPE_WAIT;
 }
 
+int nbc_op_free_init(struct nbc_op * op, void * buff) {
+    op->trig = 0;
+    op->done = 0;
+    op->t = TYPE_FREE;
+    op->buff = buff;
+}
+
+int nbc_op_mpi_op_init(struct nbc_op * op,
+                       MPI_Datatype datatype,
+                       int count,
+                       void * buff,
+                       void * buff2,
+                       void * out_buff,
+                       MPI_Op mpi_op)
+{
+    op->trig = 0;
+    op->done = 0;
+    op->t = TYPE_MPI_OP;
+    op->datatype = datatype;
+    op->count = count;
+    op->buff = buff;
+    op->buff2 = buff2;
+    op->out_buff = out_buff;
+    op->mpi_op = mpi_op;
+}
 
 
 int nbc_op_trigger( struct nbc_op * op )
@@ -108,14 +168,27 @@ int nbc_op_trigger( struct nbc_op * op )
         }
     }
 
+#ifdef DEBUG
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+#endif
+
     switch (op->t) {
         case TYPE_SEND:
-            LOG(stderr, "----> SEND %d\n", op->remote);
+            LOG(stderr, "%d ----> SEND %d\n", rank, op->remote);
             MPI_Isend(op->buff, op->count, op->datatype, op->remote, op->tag, op->comm, &op->request);
             break; 
          case TYPE_RECV:
-            LOG(stderr, "<---- RECV %d\n", op->remote);
+            LOG(stderr, "%d <---- RECV %d\n", rank, op->remote);
             MPI_Irecv(op->buff, op->count, op->datatype, op->remote, op->tag, op->comm, &op->request);
+            break;
+        case TYPE_MPI_OP:
+            LOG(stderr, "%d ----- OP %s\n", rank, op_to_string(op->mpi_op));
+            NBC_Operation(op->out_buff, op->buff, op->buff2, op->mpi_op, op->datatype, op->count);
+            break;
+        case TYPE_FREE:
+            LOG(stderr, "%d ----- FREE %p\n", rank, op->buff);
+            free(op->buff);
             break;
         default:
             LOG(stderr, "BAD OP TYPE\n");
@@ -142,6 +215,14 @@ int nbc_op_test( struct nbc_op * op  )
     if( op->t == TYPE_NULL )
     {
         //LOG(stderr, "IS N\n");
+        return 1;
+    }
+
+    if( op->t == TYPE_MPI_OP) {
+        return 1;
+    }
+
+    if( op->t == TYPE_FREE) {
         return 1;
     }
 
@@ -426,6 +507,101 @@ static inline int start_request(xMPI_Request * xreq, MPI_Request * request) {
                                 request);
 }
 
+int MPI_Ixreduce(const void* sendbuf, void* recvbuf, int count, MPI_Datatype datatype, MPI_Op op, int root, MPI_Comm comm, MPI_Request *request) {
+    
+    xMPI_Request * xreq = xMPI_Request_new(request, 11);
+
+    int type_size;
+    MPI_Type_size(datatype, &type_size);
+    const int buff_size = count * type_size;
+
+    int rank, size, parent, lc, rc;
+    setup_binary_tree(comm, root, &rank, &size, &parent, &lc, &rc);
+
+    if(size > 1) {
+        void * lc_buff = NULL; 
+        int free_lc_buff = 0;
+        void * rc_buff = NULL;
+        int free_rc_buff = 0;
+        void * work_buff = NULL;
+        int free_work_buff = 0;
+        void * out_buff = NULL;
+        int free_out_buff = 0;
+
+        if( 0 <= lc ) {
+            // If I have a left child, allocate a buffer and receive into it.
+            lc_buff = malloc(buff_size);
+            free_lc_buff = 1;
+            nbc_op_init( &xreq->op[0], TYPE_RECV, lc, comm, datatype, count, lc_buff, 12345 );
+        }
+
+        if( 0 <= rc ) {
+            // If I have a right child, allocate a buffer and receive into it.
+            rc_buff = malloc(buff_size);
+            free_rc_buff = 1;
+            nbc_op_init( &xreq->op[1], TYPE_RECV, rc, comm, datatype, count, rc_buff, 12345 );
+        }
+
+        // Then wait for the receives from my children to finish.
+        nbc_op_wait_init(&xreq->op[2]);
+
+        if( lc_buff != NULL && rc_buff != NULL ) {
+            // If I have two children, I need to reduce them together.
+            work_buff = malloc(buff_size);
+            free_work_buff = 1;
+            nbc_op_mpi_op_init(&xreq->op[3], datatype, count, lc_buff, rc_buff, work_buff, op);
+        } else if( lc_buff != NULL ) {
+            // If I have only one child, I just save it for the next step.    
+            work_buff = lc_buff;
+        }
+
+        if(work_buff != NULL) {
+            if(parent == -1) {
+                // If am the root, I save the results into my recvbuffer,
+                out_buff = recvbuf;
+            } else {
+                // otherwise into an intermediate buffer.
+                out_buff = malloc(buff_size);
+                free_out_buff = 1;
+            }
+            // If I have any children, I need to reduce my buffer with the values from my children.
+            nbc_op_mpi_op_init(&xreq->op[4], datatype, count, (void*)sendbuf, work_buff, out_buff, op);
+        } else {
+            // If I have no children, I need to send my unmodified input buffer
+            out_buff = (void*)sendbuf;
+        }
+
+        // Send the output to my parent, if I have one.
+        if(0 <= parent) {
+            nbc_op_init( &xreq->op[5], TYPE_SEND, parent, comm, datatype, count, out_buff, 12345 );
+        }
+
+        // And wait for completion
+        nbc_op_wait_init(&xreq->op[6]);
+
+        // Finally, free any memory we allocated
+        if(free_lc_buff) {
+            nbc_op_free_init(&xreq->op[7], lc_buff);
+        }
+        if(free_rc_buff) {
+            nbc_op_free_init(&xreq->op[8], rc_buff);
+        }
+        if(free_work_buff) {
+            nbc_op_free_init(&xreq->op[9], work_buff);
+        }
+        if(free_out_buff) {
+            nbc_op_free_init(&xreq->op[10], out_buff);
+        }
+
+    } else {
+        // Special case for only one rank: just copy sendbuf to recvbuf
+        memcpy(recvbuf, sendbuf, buff_size);
+    }
+
+    
+    return start_request(xreq, request);
+}
+
 int MPI_Ixbcast(void* buffer, int count, MPI_Datatype datatype, int root, MPI_Comm comm, MPI_Request *request) { 
     // This is more or less the same as the barrier, except that we start from the root
     // of the tree instead of the leaves, and the tree can have an arbitrary root
@@ -447,14 +623,14 @@ int MPI_Ixbcast(void* buffer, int count, MPI_Datatype datatype, int root, MPI_Co
         // If this node has a left child, send the payload to it
         nbc_op_init(&xreq->op[2], TYPE_SEND, lc, comm, datatype, count, buffer, 12345);
         // and receive from lc to hear that the left subtree is complete
-        nbc_op_init(&xreq->op[3], TYPE_RECV, lc, comm, MPI_CHAR, 1, &c, 23456);
+        nbc_op_init(&xreq->op[3], TYPE_RECV, lc, comm, MPI_CHAR, 1, &c, 12345);
     }
 
     if(0 <= rc) {
         // If this node has a right child, send the payload to it
         nbc_op_init(&xreq->op[4], TYPE_SEND, rc, comm, datatype, count, buffer, 12345);
         // and receive from rc to hear that the right subtree is complete
-        nbc_op_init(&xreq->op[5], TYPE_RECV, rc, comm, MPI_CHAR, 1, &c, 23456);
+        nbc_op_init(&xreq->op[5], TYPE_RECV, rc, comm, MPI_CHAR, 1, &c, 12345);
     }
 
     // Wait to receive completion notification from children
@@ -462,7 +638,7 @@ int MPI_Ixbcast(void* buffer, int count, MPI_Datatype datatype, int root, MPI_Co
 
     // Send completion notification to parent, if I have one
     if(0 <= parent) {
-        nbc_op_init(&xreq->op[7], TYPE_SEND, parent, comm, MPI_CHAR, 1, &c, 23456);
+        nbc_op_init(&xreq->op[7], TYPE_SEND, parent, comm, MPI_CHAR, 1, &c, 12345);
     }
     
     // Wait for completion notification to be sent
@@ -565,6 +741,48 @@ int do_bcast_test(int root) {
     free(bcast_buf);
 }
 
+int do_reduce_test(int root) {
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    int * sendbuf = calloc(5, sizeof(int));
+    int * recvbuf = NULL;
+    if(rank == root) {
+        recvbuf = calloc(5, sizeof(int));    
+    }
+    int i;
+    for(int i = 0; i < 5; ++i) {
+        sendbuf[i] = rank + i;
+    }
+
+    MPI_Request reduce_req;
+    MPI_Ixreduce(sendbuf, recvbuf, 5, MPI_INT, MPI_SUM, root, MPI_COMM_WORLD, &reduce_req);
+    fprintf(stderr, "HELLO from %d (Before MPI_Ixreduce wait)\n", rank);
+    MPI_Wait(&reduce_req, MPI_STATUS_IGNORE);
+    fprintf(stderr, "OLLEH from %d (After MPI_Ixreduce wait)\n", rank);
+
+    free(sendbuf);
+
+
+
+    if(rank == root) {
+        fprintf(stderr, "Root has: %d %d %d %d %d\n", recvbuf[0], recvbuf[1], recvbuf[2], recvbuf[3], recvbuf[4]);
+        int correct[5];
+        correct[0] = (size * (size-1))/2;
+        int i;
+        for(int i = 1; i < 5; ++i) {
+            correct[i] = correct[i-1] + size;    
+        }
+        for(int i = 0; i < 5; ++i) {
+            if(correct[i] != recvbuf[i]) {
+                fprintf(stderr, "Validation failed! recvbuf[%d] should have been %d but was %d.\n", i, correct[i], recvbuf[i]);
+            }
+        }
+        free(recvbuf);
+    }
+}
+
 int main( int argc, char *argv[])
 {
     int rank, size;
@@ -595,8 +813,20 @@ int main( int argc, char *argv[])
 
     MPI_Barrier(MPI_COMM_WORLD);
 
-    do_bcast_test(1);
+    if(size > 1) {
+        do_bcast_test(1);
+    }
     
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    do_reduce_test(0);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    
+    if(size > 1) {
+        do_reduce_test(1);
+    }
+
     MPI_Barrier(MPI_COMM_WORLD);
    
     MPI_Finalize();
