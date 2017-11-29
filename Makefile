@@ -2,7 +2,7 @@ MPICC=mpicc
 
 all : egreq
 
-egreq : egreq.c
+egreq : egreq.c nbc_op.c
 	$(MPICC) -g -o $@ $^
 
 run : egreq
