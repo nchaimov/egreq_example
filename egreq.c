@@ -6,9 +6,6 @@
 #include "nbc_op.h"
 
 
-// TODO MPI_IN_PLACE support
-// TODO User definedoperations
-
 #ifdef DEBUG
 #define LOG(...) fprintf(__VA_ARGS__)
 
@@ -41,6 +38,7 @@ typedef enum {
     TYPE_WAIT,
     TYPE_MPI_OP,
     TYPE_FREE,
+    TYPE_COMM_FREE,
     TYPE_COUNT
 }nbc_op_type;
 
@@ -50,7 +48,8 @@ static const char * const strops[TYPE_COUNT] = {
     "RECV",
     "WAIT",
     "MPI_OP",
-    "FREE"
+    "FREE",
+    "COMM_FREE"
 };
 
 
@@ -79,10 +78,10 @@ struct nbc_op{
 
 typedef struct _xMPI_Request
 {
-    struct nbc_op  op[16];
     int size;
     int current_off;
     MPI_Request * myself;
+    struct nbc_op op[0];
 } xMPI_Request;
 
 
@@ -106,6 +105,7 @@ int nbc_op_init( struct nbc_op * op,
     op->buff = buff;
     op->buff2 = NULL;
     op->out_buff = NULL;
+
     op->datatype = datatype;
     op->count = count;
     op->tag = tag;
@@ -122,6 +122,13 @@ int nbc_op_free_init(struct nbc_op * op, void * buff) {
     op->done = 0;
     op->t = TYPE_FREE;
     op->buff = buff;
+}
+
+int nbc_op_comm_free_init(struct nbc_op * op, MPI_Comm comm) {
+    op->trig = 0;
+    op->done = 0;
+    op->t = TYPE_COMM_FREE;
+    op->comm = comm;
 }
 
 int nbc_op_mpi_op_init(struct nbc_op * op,
@@ -190,6 +197,10 @@ int nbc_op_trigger( struct nbc_op * op )
             LOG(stderr, "%d ----- FREE %p\n", rank, op->buff);
             free(op->buff);
             break;
+        case TYPE_COMM_FREE:
+            LOG(stderr, "%d ----- COMM_FREE %p\n", rank, &op->buff);
+            MPI_Comm_free(&op->comm);
+            break;
         default:
             LOG(stderr, "BAD OP TYPE\n");
             abort();
@@ -226,6 +237,10 @@ int nbc_op_test( struct nbc_op * op  )
         return 1;
     }
 
+    if( op->t == TYPE_COMM_FREE) {
+        return 1;
+    }
+
     if( op->done )
     {
         //LOG(stderr, "IS D\n");
@@ -238,7 +253,7 @@ int nbc_op_test( struct nbc_op * op  )
 
     if( flag )
     {
-        //LOG(stderr, "%d COMPLETED (%s to %d)\n", rank, strops[op->t], op->remote );
+        LOG(stderr, "%d COMPLETED (%s to %d)\n", rank, strops[op->t], op->remote );
         op->done = 1;
     }
     else
@@ -252,7 +267,7 @@ int nbc_op_test( struct nbc_op * op  )
 
 xMPI_Request * xMPI_Request_new(MPI_Request * parent, int size)
 {
-    xMPI_Request * ret = malloc( sizeof(xMPI_Request));
+    xMPI_Request * ret = malloc( sizeof(xMPI_Request) + (sizeof(struct nbc_op) * size));
 
     if( !ret )
     {
@@ -507,9 +522,96 @@ static inline int start_request(xMPI_Request * xreq, MPI_Request * request) {
                                 request);
 }
 
-int MPI_Ixreduce(const void* sendbuf, void* recvbuf, int count, MPI_Datatype datatype, MPI_Op op, int root, MPI_Comm comm, MPI_Request *request) {
+
+int MPI_Ixscatter(const void *sendbuf, int sendcount, MPI_Datatype sendtype, void *recvbuf, int recvcount, MPI_Datatype recvtype, int root, MPI_Comm comm_in, MPI_Request * request) {
+    // Currently this is a simple linear gather as in libnbc.
+    // TODO replace with better algorithm
+    // TODO MPI_IN_PLACE
     
-    xMPI_Request * xreq = xMPI_Request_new(request, 11);
+    MPI_Comm comm;
+    MPI_Comm_dup(comm_in, &comm);
+
+    int rank, size;
+    MPI_Comm_rank( comm , &rank );
+    MPI_Comm_size( comm , &size );
+
+    int send_size, recv_size;
+    MPI_Type_size(sendtype, &send_size);
+    MPI_Type_size(recvtype, &recv_size);
+    const int send_bytes = send_size * recvcount;
+    const int my_offset = send_bytes * rank;
+
+    xMPI_Request * xreq;
+
+    if(rank == root) {
+        // If I am the root, I send to all other ranks.
+        xreq = xMPI_Request_new(request, size + 2);
+        memcpy(recvbuf + my_offset, sendbuf, send_bytes);
+        int i;
+        for(i = 0; i < size; ++i) {
+            if(i == root) continue;
+            const int their_offset = send_bytes * i;
+            nbc_op_init(&xreq->op[i], TYPE_SEND, i, comm, sendtype, sendcount, (void*)sendbuf + their_offset, 12345);
+        }
+        nbc_op_wait_init(&xreq->op[size]);
+    } else {
+        // Otherwise, I receive from the root.
+        xreq = xMPI_Request_new(request, 3);
+        nbc_op_init( &xreq->op[0], TYPE_RECV, root, comm, recvtype, recvcount, recvbuf, 12345 );
+        nbc_op_wait_init(&xreq->op[1]);
+    }
+    
+    return start_request(xreq, request);
+}
+
+int MPI_Ixgather(const void *sendbuf, int sendcount, MPI_Datatype sendtype, void *recvbuf, int recvcount, MPI_Datatype recvtype, int root, MPI_Comm comm_in, MPI_Request * request) {
+    // Currently this is a simple linear gather as in libnbc.
+    // TODO replace with better algorithm
+    // TODO MPI_IN_PLACE
+    
+    MPI_Comm comm;
+    MPI_Comm_dup(comm_in, &comm);
+
+    int rank, size;
+    MPI_Comm_rank( comm , &rank );
+    MPI_Comm_size( comm , &size );
+
+    int send_size, recv_size;
+    MPI_Type_size(sendtype, &send_size);
+    MPI_Type_size(recvtype, &recv_size);
+    const int recv_bytes = recv_size * recvcount;
+    const int my_offset = recv_bytes * rank;
+
+    xMPI_Request * xreq;
+
+    if(rank == root) {
+        // If I am the root, I receive from all other ranks.
+        xreq = xMPI_Request_new(request, size + 2);
+        memcpy(recvbuf + my_offset, sendbuf, recv_bytes);
+        int i;
+        for(i = 0; i < size; ++i) {
+            if(i == root) continue;
+            const int their_offset = recv_bytes * i;
+            nbc_op_init(&xreq->op[i], TYPE_RECV, i, comm, recvtype, recvcount, recvbuf + their_offset, 12345);
+        }
+        nbc_op_wait_init(&xreq->op[size]);
+    } else {
+        // Otherwise, I send to the root.
+        xreq = xMPI_Request_new(request, 3);
+        nbc_op_init( &xreq->op[0], TYPE_SEND, root, comm, sendtype, sendcount, (void*)sendbuf, 12345 );
+        nbc_op_wait_init(&xreq->op[1]);
+    }
+    
+    return start_request(xreq, request);
+}
+
+int MPI_Ixreduce(const void* sendbuf, void* recvbuf, int count, MPI_Datatype datatype, MPI_Op op, int root, MPI_Comm comm_in, MPI_Request *request) {
+    
+    // TODO User defined operations
+    // TODO MPI_IN_PLACE
+    xMPI_Request * xreq = xMPI_Request_new(request, 13);
+    MPI_Comm comm;
+    MPI_Comm_dup(comm_in, &comm);
 
     int type_size;
     MPI_Type_size(datatype, &type_size);
@@ -519,6 +621,7 @@ int MPI_Ixreduce(const void* sendbuf, void* recvbuf, int count, MPI_Datatype dat
     setup_binary_tree(comm, root, &rank, &size, &parent, &lc, &rc);
 
     if(size > 1) {
+
         void * lc_buff = NULL; 
         int free_lc_buff = 0;
         void * rc_buff = NULL;
@@ -593,20 +696,25 @@ int MPI_Ixreduce(const void* sendbuf, void* recvbuf, int count, MPI_Datatype dat
             nbc_op_free_init(&xreq->op[10], out_buff);
         }
 
+        nbc_op_comm_free_init(&xreq->op[11], comm);
+
     } else {
         // Special case for only one rank: just copy sendbuf to recvbuf
         memcpy(recvbuf, sendbuf, buff_size);
+        MPI_Comm_free(&comm);
     }
-
     
     return start_request(xreq, request);
 }
 
-int MPI_Ixbcast(void* buffer, int count, MPI_Datatype datatype, int root, MPI_Comm comm, MPI_Request *request) { 
+int MPI_Ixbcast(void* buffer, int count, MPI_Datatype datatype, int root, MPI_Comm comm_in, MPI_Request *request) { 
     // This is more or less the same as the barrier, except that we start from the root
     // of the tree instead of the leaves, and the tree can have an arbitrary root
     // (which is accomplished by swapping 0 and the user-specified root)
-    xMPI_Request * xreq = xMPI_Request_new(request, 9);
+    xMPI_Request * xreq = xMPI_Request_new(request, 11);
+
+    MPI_Comm comm;
+    MPI_Comm_dup(comm_in, &comm);
 
     int rank, size, parent, lc, rc;
     setup_binary_tree(comm, root, &rank, &size, &parent, &lc, &rc);
@@ -644,12 +752,17 @@ int MPI_Ixbcast(void* buffer, int count, MPI_Datatype datatype, int root, MPI_Co
     // Wait for completion notification to be sent
     nbc_op_wait_init(&xreq->op[8]);
 
+    nbc_op_comm_free_init(&xreq->op[9], comm);
+
     return start_request(xreq, request);
 }
 
-int MPI_Ixbarrier( MPI_Comm comm , MPI_Request * req )
+int MPI_Ixbarrier( MPI_Comm comm_in , MPI_Request * req )
 {
-    xMPI_Request * xreq = xMPI_Request_new(req, 9);
+    xMPI_Request * xreq = xMPI_Request_new(req, 10);
+
+    MPI_Comm comm;
+    MPI_Comm_dup(comm_in, &comm);
 
     ////LOG(stderr, "INIT on %p\n", req);
 
@@ -705,6 +818,8 @@ int MPI_Ixbarrier( MPI_Comm comm , MPI_Request * req )
     //LOG(stderr, "POST %d WAIT\n", rank );
     //nbc_op_init( &xreq->op[8], TYPE_WAIT, parent, comm, MPI_CHAR, 1, &c, 12345 );
     nbc_op_wait_init(&xreq->op[8]);
+
+    nbc_op_comm_free_init(&xreq->op[9], comm);
  
     return start_request(xreq, req);
 }
@@ -749,10 +864,11 @@ int do_reduce_test(int root) {
     int * sendbuf = calloc(5, sizeof(int));
     int * recvbuf = NULL;
     if(rank == root) {
+        fprintf(stderr, "\n\nWill reduce from rank %d\n", rank);
         recvbuf = calloc(5, sizeof(int));    
     }
     int i;
-    for(int i = 0; i < 5; ++i) {
+    for(i = 0; i < 5; ++i) {
         sendbuf[i] = rank + i;
     }
 
@@ -781,6 +897,89 @@ int do_reduce_test(int root) {
         }
         free(recvbuf);
     }
+}
+
+int do_gather_test(int root) {
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    int * sendbuf = calloc(5, sizeof(int));
+
+    int i;
+    for(i = 0; i < 5; ++i) {
+        sendbuf[i] = rank + i;
+    }
+
+    int * recvbuf;
+    if(rank == root) {
+        fprintf(stderr, "\n\nWill gather on rank %d\n", rank);
+        recvbuf = calloc(5*size, sizeof(int));
+    }
+
+    MPI_Request gather_req;
+    MPI_Ixgather(sendbuf, 5, MPI_INT, recvbuf, 5, MPI_INT, root, MPI_COMM_WORLD, &gather_req);
+    fprintf(stderr, "HELLO from %d (Before MPI_Ixgather wait)\n", rank);
+    MPI_Wait(&gather_req, MPI_STATUS_IGNORE);
+    fprintf(stderr, "OLLEH from %d (After MPI_Ixgather wait)\n", rank);
+
+    free(sendbuf);
+
+    if(rank == root) {
+        fprintf(stderr, "Root has: ");
+        int i;
+        for(i = 0; i < 5 * size; ++i) {
+            fprintf(stderr, "%d ", recvbuf[i]);
+        }
+        fprintf(stderr, "\n");
+    }
+    
+}
+
+int do_scatter_test(int root) {
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    int * sendbuf;
+    
+    if(rank == root) {
+        fprintf(stderr, "\n\nWill scatter from rank %d\n", rank);
+        sendbuf = calloc(5 * size, sizeof(int));
+
+        int i;
+        for(i = 0; i < size; ++i) {
+            int j;
+            for(j = 0; j < 5; ++j) {
+                sendbuf[i*5 + j] = i + j;
+            }
+        }
+    }
+
+    int * recvbuf;
+    recvbuf = calloc(5, sizeof(int));
+
+    MPI_Request scatter_req;
+    MPI_Ixscatter(sendbuf, 5, MPI_INT, recvbuf, 5, MPI_INT, root, MPI_COMM_WORLD, &scatter_req);
+    //MPI_Iscatter(sendbuf, 5, MPI_INT, recvbuf, 5, MPI_INT, root, MPI_COMM_WORLD, &scatter_req);
+    fprintf(stderr, "HELLO from %d (Before MPI_Ixscatter wait)\n", rank);
+    MPI_Wait(&scatter_req, MPI_STATUS_IGNORE);
+    fprintf(stderr, "OLLEH from %d (After MPI_Ixscatter wait)\n", rank);
+
+    if(rank == root) {
+        free(sendbuf);
+    }
+
+    fprintf(stderr, "Rank %d  has %d %d %d %d %d\n", rank, recvbuf[0], recvbuf[1], recvbuf[2], recvbuf[3], recvbuf[4]);
+
+    int i;
+    for(i = 0; i < 5; ++i) {
+        if(recvbuf[i] != rank + i) {
+            fprintf(stderr, "Validation failed! recvbuf[%d] should have been %d but was %d\n", i, rank + i, recvbuf[i]);
+        }
+    }
+
+    free(recvbuf);
 }
 
 int main( int argc, char *argv[])
@@ -826,6 +1025,20 @@ int main( int argc, char *argv[])
     if(size > 1) {
         do_reduce_test(1);
     }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    do_gather_test(0);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    if(size > 1) {
+        do_gather_test(1);
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    do_scatter_test(0);
 
     MPI_Barrier(MPI_COMM_WORLD);
    
