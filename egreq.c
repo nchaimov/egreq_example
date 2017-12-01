@@ -546,7 +546,7 @@ int MPI_Ixscatter(const void *sendbuf, int sendcount, MPI_Datatype sendtype, voi
     if(rank == root) {
         // If I am the root, I send to all other ranks.
         xreq = xMPI_Request_new(request, size + 2);
-        memcpy(recvbuf + my_offset, sendbuf, send_bytes);
+        memcpy(recvbuf, sendbuf + my_offset, send_bytes);
         int i;
         for(i = 0; i < size; ++i) {
             if(i == root) continue;
@@ -1041,6 +1041,10 @@ int main( int argc, char *argv[])
     do_scatter_test(0);
 
     MPI_Barrier(MPI_COMM_WORLD);
+
+    if(size > 1) {
+        do_scatter_test(1);
+    }
    
     MPI_Finalize();
 
